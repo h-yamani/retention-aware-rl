@@ -1,0 +1,9 @@
+# Stage I placeholder configuration
+algorithm: SAC
+vem:
+  capacity: 20
+retention:
+  checkpoint_interval_steps: 10000
+  revisit_rollouts: 5
+experiment:
+  intervention_enabled: false
