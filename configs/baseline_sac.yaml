@@ -1,0 +1,35 @@
+algorithm: SAC
+
+environment:
+  id: HalfCheetah-v5
+
+training:
+  total_timesteps: 100000
+  learning_rate: 0.0003
+  buffer_size: 1000000
+  learning_starts: 5000
+  batch_size: 256
+  tau: 0.005
+  gamma: 0.99
+  train_freq: 1
+  gradient_steps: 1
+
+policy:
+  type: MlpPolicy
+  network:
+    - 256
+    - 256
+  entropy_coefficient: auto
+  target_entropy: auto
+
+evaluation:
+  eval_freq: 5000
+  n_eval_episodes: 5
+  deterministic: true
+
+experiment:
+  seed: 0
+  retention_enabled: false
+  intervention_enabled: false
+  prioritized_replay: false
+  episode_repetition: false
