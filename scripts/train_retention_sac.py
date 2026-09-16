@@ -33,6 +33,12 @@ from retention_rl.diagnostics.experiment_metadata import (
 from retention_rl.diagnostics.sac_diagnostics import (
     SACDiagnosticsCallback,
 )
+from retention_rl.retention.stage1_callback import (
+    Stage1RetentionCallback,
+)
+
+
+LEARNING_STARTS = 10_000
 
 
 def make_env(
@@ -105,6 +111,18 @@ def main():
         default=5,
     )
 
+    parser.add_argument(
+        "--vem-capacity",
+        type=int,
+        default=20,
+    )
+
+    parser.add_argument(
+        "--retention-freq",
+        type=int,
+        default=10_000,
+    )
+
     args = parser.parse_args()
 
     # ---------------------------------------------------------
@@ -119,7 +137,7 @@ def main():
 
     result_dir = os.path.join(
         "results",
-        "baseline_sac",
+        "retention_sac",
         run_name,
     )
 
@@ -163,6 +181,11 @@ def main():
         "tensorboard",
     )
 
+    retention_dir = os.path.join(
+        result_dir,
+        "retention",
+    )
+
     directories = [
         model_dir,
         checkpoint_dir,
@@ -172,6 +195,7 @@ def main():
         metadata_dir,
         monitor_dir,
         tensorboard_dir,
+        retention_dir,
     ]
 
     for directory in directories:
@@ -181,7 +205,7 @@ def main():
         )
 
     # ---------------------------------------------------------
-    # Training and standard evaluation environments
+    # Training and evaluation environments
     # ---------------------------------------------------------
 
     train_monitor = os.path.join(
@@ -207,7 +231,11 @@ def main():
     )
 
     # ---------------------------------------------------------
-    # SAC baseline
+    # SAC
+    #
+    # IMPORTANT:
+    # These settings intentionally match train_baseline_sac.py.
+    # Stage I changes measurement only, not SAC.
     # ---------------------------------------------------------
 
     model = SAC(
@@ -216,7 +244,7 @@ def main():
 
         learning_rate=3e-4,
         buffer_size=1_000_000,
-        learning_starts=10_000,
+        learning_starts=LEARNING_STARTS,
         batch_size=256,
 
         tau=0.005,
@@ -286,10 +314,7 @@ def main():
     )
 
     # ---------------------------------------------------------
-    # Standard SB3 evaluation
-    #
-    # Preserves raw returns in evaluations.npz and saves
-    # best_model.zip.
+    # Standard evaluation
     # ---------------------------------------------------------
 
     eval_callback = EvalCallback(
@@ -307,10 +332,7 @@ def main():
     )
 
     # ---------------------------------------------------------
-    # Detailed behavioral evaluation
-    #
-    # Uses an independent environment and does not affect
-    # training experience.
+    # Detailed evaluation
     # ---------------------------------------------------------
 
     detailed_eval_callback = (
@@ -351,12 +373,31 @@ def main():
         )
     )
 
+    # ---------------------------------------------------------
+    # Stage-I retention measurement
+    #
+    # OBSERVATIONAL ONLY.
+    #
+    # VEM and F do not modify SAC training.
+    # ---------------------------------------------------------
+
+    retention_callback = (
+        Stage1RetentionCallback(
+            output_dir=retention_dir,
+            vem_capacity=args.vem_capacity,
+            retention_interval_steps=args.retention_freq,
+            learning_starts=LEARNING_STARTS,
+            verbose=1,
+        )
+    )
+
     callbacks = CallbackList(
         [
             eval_callback,
             detailed_eval_callback,
             checkpoint_callback,
             diagnostic_callback,
+            retention_callback,
         ]
     )
 
@@ -366,7 +407,7 @@ def main():
 
     print()
     print("=" * 70)
-    print("RESEARCH BASELINE — SAC")
+    print("STAGE I — RETENTION MEASUREMENT SAC")
     print("=" * 70)
 
     print(
@@ -382,6 +423,28 @@ def main():
     print(
         "Seed:",
         args.seed,
+    )
+
+    print()
+
+    print(
+        "Learning starts:",
+        LEARNING_STARTS,
+    )
+
+    print(
+        "VEM capacity:",
+        args.vem_capacity,
+    )
+
+    print(
+        "Retention frequency:",
+        args.retention_freq,
+    )
+
+    print(
+        "Intervention:",
+        "DISABLED",
     )
 
     print()
@@ -460,7 +523,7 @@ def main():
 
     print()
     print("=" * 70)
-    print("TRAINING COMPLETE")
+    print("STAGE I TRAINING COMPLETE")
     print("=" * 70)
 
     print(
@@ -469,13 +532,16 @@ def main():
     )
 
     print(
-        "Initial model:",
-        initial_model_path + ".zip",
+        "Final model:",
+        final_path + ".zip",
     )
 
     print(
-        "Final model:",
-        final_path + ".zip",
+        "Retention history:",
+        os.path.join(
+            retention_dir,
+            "retention_history.csv",
+        ),
     )
 
     print(
@@ -491,14 +557,6 @@ def main():
         os.path.join(
             diagnostic_dir,
             "sac_diagnostics.csv",
-        ),
-    )
-
-    print(
-        "Raw SB3 evaluation:",
-        os.path.join(
-            eval_dir,
-            "evaluations.npz",
         ),
     )
 
@@ -523,6 +581,28 @@ def main():
         metadata_path,
     )
 
+    print()
+
+    print(
+        "Completed episodes:",
+        retention_callback.total_completed_episodes,
+    )
+
+    print(
+        "Policy episodes:",
+        retention_callback.policy_completed_episodes,
+    )
+
+    print(
+        "VEM admissions:",
+        retention_callback.vem_admissions,
+    )
+
+    print(
+        "Final VEM size:",
+        len(retention_callback.vem),
+    )
+
     print("=" * 70)
 
     train_env.close()
@@ -531,4 +611,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
