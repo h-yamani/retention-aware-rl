@@ -2,74 +2,59 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import gymnasium as gym
 import numpy as np
+
 from stable_baselines3.common.callbacks import BaseCallback
 
-from retention_rl.memory import ValuableEpisodicMemory
+from retention_rl.envs.mujoco_state import (
+    capture_mujoco_state,
+)
+from retention_rl.memory import (
+    ValuableEpisodicMemory,
+)
+from retention_rl.retention.capability_evaluator import (
+    CapabilityEvaluator,
+)
 from retention_rl.retention.episode_tracker import (
     EpisodeTracker,
     finalize_and_add_to_vem,
 )
-from retention_rl.retention.retention_tracker import RetentionTracker
+from retention_rl.retention.retention_tracker import (
+    RetentionTracker,
+)
 
 
 class Stage1RetentionCallback(BaseCallback):
     """
-    Stage-I retention measurement callback for SB3 SAC.
+    Stage-I observational retention callback.
 
-    This callback is observational only.
+    Responsibilities:
+      1. Track complete episodes.
+      2. Reject episodes containing SAC warm-up actions.
+      3. Capture the exact MuJoCo state at episode start.
+      4. Store valuable policy-generated episodes in VEM.
+      5. Measure trajectory retention deficit F periodically.
+      6. Prepare an independent environment for later capability
+         revisit measurements.
 
-    It does NOT:
-        - modify SAC updates
-        - modify replay sampling
-        - repeat actions
-        - change rewards
-        - change policy actions
-        - train from VEM
-
-    It performs three jobs:
-
-    1. Collect complete policy-generated episodes.
-    2. Maintain top-M Valuable Episodic Memory (VEM).
-    3. Periodically recompute current NLL and retention deficit F.
-
-    Important SB3 conventions
-    -------------------------
-    The callback receives local variables from
-    OffPolicyAlgorithm.collect_rollouts().
-
-    Relevant variables include:
-
-        actions
-            Environment-space action.
-
-        buffer_actions
-            Normalized action in [-1, 1].
-            This is the representation stored by SB3 replay
-            and the representation expected by the SAC
-            squashed Gaussian log-probability calculation.
-
-        new_obs
-            Next VecEnv observation. On terminal transitions,
-            VecEnv has already reset, so this may be the first
-            observation of the NEXT episode.
-
-        infos[i]["terminal_observation"]
-            Correct terminal observation for a finished episode.
-
-    Therefore this callback stores buffer_actions and explicitly
-    recovers terminal_observation on episode boundaries.
+    IMPORTANT:
+        This callback does not modify SAC actions, gradients,
+        replay-buffer sampling, rewards, or policy updates.
     """
 
     def __init__(
         self,
-        output_dir: str | Path,
+        output_dir,
         vem_capacity: int = 20,
         retention_interval_steps: int = 10_000,
-        learning_starts: int = 5_000,
+        learning_starts: int = 10_000,
+        revisit_rollouts: int = 5,
         verbose: int = 1,
-    ) -> None:
-        super().__init__(verbose=verbose)
+    ):
+        super().__init__(
+            verbose=verbose
+        )
 
         if vem_capacity <= 0:
             raise ValueError(
@@ -81,9 +66,23 @@ class Stage1RetentionCallback(BaseCallback):
                 "retention_interval_steps must be positive."
             )
 
-        self.output_dir = Path(output_dir)
+        if learning_starts < 0:
+            raise ValueError(
+                "learning_starts must be non-negative."
+            )
 
-        self.vem_capacity = int(vem_capacity)
+        if revisit_rollouts <= 0:
+            raise ValueError(
+                "revisit_rollouts must be positive."
+            )
+
+        self.output_dir = Path(
+            output_dir
+        )
+
+        self.vem_capacity = int(
+            vem_capacity
+        )
 
         self.retention_interval_steps = int(
             retention_interval_steps
@@ -91,6 +90,10 @@ class Stage1RetentionCallback(BaseCallback):
 
         self.learning_starts = int(
             learning_starts
+        )
+
+        self.revisit_rollouts = int(
+            revisit_rollouts
         )
 
         self.vem = ValuableEpisodicMemory(
@@ -104,7 +107,10 @@ class Stage1RetentionCallback(BaseCallback):
             )
         )
 
-        self.episode_tracker: EpisodeTracker | None = None
+        self.capability_evaluator = None
+        self.revisit_env = None
+
+        self.episode_tracker = None
 
         self.next_episode_id = 0
 
@@ -116,85 +122,208 @@ class Stage1RetentionCallback(BaseCallback):
         self.policy_completed_episodes = 0
         self.vem_admissions = 0
 
-    def _on_training_start(self) -> None:
+    def _get_training_env(self):
+        """
+        Return the single underlying Gymnasium training environment.
+
+        Stage I currently requires one environment.
+        """
+
+        vec_env = self.model.get_env()
+
+        if vec_env.num_envs != 1:
+            raise RuntimeError(
+                "Stage1RetentionCallback currently "
+                "supports exactly one environment."
+            )
+
+        if not hasattr(vec_env, "envs"):
+            raise RuntimeError(
+                "Training VecEnv does not expose envs."
+            )
+
+        return vec_env.envs[0]
+
+    def _get_env_id(self) -> str:
+        """
+        Recover the Gymnasium environment ID from the training env.
+        """
+
+        training_env = self._get_training_env()
+
+        base_env = training_env.unwrapped
+
+        if base_env.spec is None:
+            raise RuntimeError(
+                "Could not determine environment specification."
+            )
+
+        if base_env.spec.id is None:
+            raise RuntimeError(
+                "Could not determine environment ID."
+            )
+
+        return str(
+            base_env.spec.id
+        )
+
+    def _on_training_start(self):
         self.output_dir.mkdir(
             parents=True,
             exist_ok=True,
         )
 
-        if self.training_env.num_envs != 1:
+        if self.model.get_env().num_envs != 1:
             raise RuntimeError(
-                "Stage-I retention measurement currently "
-                "requires exactly one environment."
+                "Stage1RetentionCallback currently "
+                "supports exactly one environment."
             )
+
+        # -----------------------------------------------------
+        # Independent environment for capability revisits.
+        #
+        # This environment is never used for SAC training.
+        # -----------------------------------------------------
+
+        env_id = self._get_env_id()
+
+        self.revisit_env = gym.make(
+            env_id
+        )
+
+        self.capability_evaluator = (
+            CapabilityEvaluator(
+                env=self.revisit_env,
+                n_rollouts=self.revisit_rollouts,
+                deterministic=True,
+            )
+        )
+
+        # -----------------------------------------------------
+        # Start tracking the current training episode.
+        # -----------------------------------------------------
 
         initial_obs = self.model._last_obs
 
         if initial_obs is None:
             raise RuntimeError(
-                "Model has no initial observation."
+                "SAC does not expose an initial observation."
             )
 
         self._start_new_episode(
             initial_obs[0]
         )
 
+        if self.verbose:
+            print(
+                "[Stage I] retention measurement initialized"
+            )
+            print(
+                f"[Stage I] VEM capacity={self.vem_capacity}"
+            )
+            print(
+                "[Stage I] retention interval="
+                f"{self.retention_interval_steps}"
+            )
+            print(
+                "[Stage I] learning starts="
+                f"{self.learning_starts}"
+            )
+            print(
+                "[Stage I] revisit rollouts="
+                f"{self.revisit_rollouts}"
+            )
+            print(
+                "[Stage I] intervention=DISABLED"
+            )
+
     def _start_new_episode(
         self,
         initial_obs,
-    ) -> None:
-        self.episode_tracker = EpisodeTracker(
+    ):
+        """
+        Begin tracking a new episode and capture its exact
+        initial MuJoCo simulator state.
+        """
+
+        training_env = self._get_training_env()
+
+        initial_env_state = capture_mujoco_state(
+            training_env
+        )
+
+        tracker = EpisodeTracker(
             episode_id=self.next_episode_id
         )
 
-        self.next_episode_id += 1
-
-        self.episode_tracker.start(
-            initial_state=np.asarray(
+        tracker.start(
+            np.asarray(
                 initial_obs,
                 dtype=np.float32,
-            )
+            ),
+            initial_env_state=initial_env_state,
         )
 
+        self.episode_tracker = tracker
+
+        self.next_episode_id += 1
+
     def _on_step(self) -> bool:
-        """
-        Called immediately after env.step() and before
-        SB3 stores the transition in replay.
-
-        collect_rollouts() has already incremented
-        model.num_timesteps at this point.
-        """
-
         if self.episode_tracker is None:
             raise RuntimeError(
-                "Episode tracker was not initialized."
+                "Episode tracker has not been initialized."
             )
 
-        buffer_actions = self.locals[
+        buffer_actions = self.locals.get(
             "buffer_actions"
-        ]
+        )
 
-        rewards = self.locals[
+        rewards = self.locals.get(
             "rewards"
-        ]
+        )
 
-        dones = self.locals[
+        dones = self.locals.get(
             "dones"
-        ]
+        )
 
-        infos = self.locals[
+        infos = self.locals.get(
             "infos"
-        ]
+        )
 
-        new_obs = self.locals[
+        new_obs = self.locals.get(
             "new_obs"
-        ]
+        )
 
-        # Single-env Stage I.
+        if buffer_actions is None:
+            raise RuntimeError(
+                "SB3 callback locals do not contain "
+                "buffer_actions."
+            )
+
+        if rewards is None:
+            raise RuntimeError(
+                "SB3 callback locals do not contain rewards."
+            )
+
+        if dones is None:
+            raise RuntimeError(
+                "SB3 callback locals do not contain dones."
+            )
+
+        if infos is None:
+            raise RuntimeError(
+                "SB3 callback locals do not contain infos."
+            )
+
+        if new_obs is None:
+            raise RuntimeError(
+                "SB3 callback locals do not contain new_obs."
+            )
+
         action = np.asarray(
             buffer_actions[0],
             dtype=np.float32,
-        )
+        ).copy()
 
         reward = float(
             rewards[0]
@@ -206,14 +335,30 @@ class Stage1RetentionCallback(BaseCallback):
 
         info = infos[0]
 
-        # num_timesteps was incremented AFTER this action.
+        # -----------------------------------------------------
+        # Warm-up boundary
         #
-        # If num_timesteps <= learning_starts, this transition
-        # was selected during SB3 random warmup.
+        # Callback occurs after num_timesteps increments.
+        #
+        # Therefore:
+        #   callback step <= learning_starts
+        #       -> action was random
+        #
+        #   callback step > learning_starts
+        #       -> action came from policy
+        # -----------------------------------------------------
+
         action_from_policy = (
             self.model.num_timesteps
             > self.learning_starts
         )
+
+        # -----------------------------------------------------
+        # Preserve true terminal observation.
+        #
+        # SB3 VecEnv new_obs is already the reset observation
+        # when done=True.
+        # -----------------------------------------------------
 
         if done:
             terminal_obs = info.get(
@@ -222,7 +367,7 @@ class Stage1RetentionCallback(BaseCallback):
 
             if terminal_obs is None:
                 raise RuntimeError(
-                    "Terminal transition did not contain "
+                    "Done transition does not contain "
                     "terminal_observation."
                 )
 
@@ -244,22 +389,29 @@ class Stage1RetentionCallback(BaseCallback):
             action_from_policy=action_from_policy,
         )
 
+        # -----------------------------------------------------
+        # Episode completion
+        # -----------------------------------------------------
+
         if done:
             self._finish_episode()
 
-            # new_obs is now the automatically reset
-            # observation for the next episode.
+            # new_obs[0] is now the reset observation for the
+            # next episode, and the physical training env has
+            # already been reset to that same state.
             self._start_new_episode(
                 new_obs[0]
             )
+
+        # -----------------------------------------------------
+        # Observational retention measurement
+        # -----------------------------------------------------
 
         self._maybe_measure_retention()
 
         return True
 
-    def _finish_episode(self) -> None:
-        assert self.episode_tracker is not None
-
+    def _finish_episode(self):
         self.total_completed_episodes += 1
 
         episode, retained = (
@@ -271,13 +423,14 @@ class Stage1RetentionCallback(BaseCallback):
             )
         )
 
-        # Warmup-contaminated episode.
+        # Episode contained at least one random warm-up action.
         if episode is None:
             if self.verbose:
                 print(
                     "[Retention] "
                     f"episode={self.episode_tracker.episode_id} "
-                    "skipped (contains warmup action)"
+                    "skipped "
+                    "(contains warm-up/random action)"
                 )
 
             return
@@ -288,46 +441,31 @@ class Stage1RetentionCallback(BaseCallback):
             self.vem_admissions += 1
 
         if self.verbose:
-            status = (
-                "VEM"
-                if retained
-                else "rejected"
-            )
-
             print(
                 "[Retention] "
                 f"episode={episode.episode_id} "
-                f"step={self.model.num_timesteps} "
-                f"return={episode.episode_return:.2f} "
-                f"insert_nll={episode.insert_nll:.4f} "
-                f"{status} "
+                f"step={episode.insert_step} "
+                f"return={episode.episode_return:.3f} "
+                f"insert_nll={episode.insert_nll:.6f} "
+                f"retained={retained} "
                 f"vem_size={len(self.vem)}"
             )
 
-    def _maybe_measure_retention(
-        self,
-    ) -> None:
-        """
-        Run retention measurement at each configured
-        global timestep checkpoint.
-
-        With interval=10,000 this gives:
-
-            10k, 20k, 30k, ...
-        """
-
+    def _maybe_measure_retention(self):
         while (
             self.model.num_timesteps
             >= self.next_retention_step
         ):
-            checkpoint_step = (
+            checkpoint_step = int(
                 self.next_retention_step
             )
 
             rows = self.retention_tracker.evaluate(
                 actor=self.model.actor,
                 vem=self.vem,
-                checkpoint_step=checkpoint_step,
+                checkpoint_step=checkpoint_step, 
+                capability_evaluator=self.capability_evaluator,
+                model=self.model,
             )
 
             if self.verbose:
@@ -340,21 +478,36 @@ class Stage1RetentionCallback(BaseCallback):
                         dtype=np.float64,
                     )
 
+                    gaps = np.asarray(
+                        [
+                           row["capability_gap"]
+                           for row in rows
+                        ],
+                        dtype=np.float64,
+                    )
+
                     print(
                         "[Retention checkpoint] "
                         f"step={checkpoint_step} "
-                        f"vem={len(rows)} "
-                        f"F_mean={deficits.mean():.4f} "
-                        f"F_max={deficits.max():.4f}"
+                        f"vem={len(self.vem)} "
+                        f"F_mean={np.mean(deficits):.6f} "
+                        f"F_max={np.max(deficits):.6f} "
+                        f"G_mean={np.mean(gaps):.3f} "
+                        f"G_max={np.max(gaps):.3f}"
                     )
 
                 else:
                     print(
                         "[Retention checkpoint] "
                         f"step={checkpoint_step} "
-                        "VEM empty"
+                        "vem=0"
                     )
 
             self.next_retention_step += (
                 self.retention_interval_steps
             )
+
+    def _on_training_end(self):
+        if self.revisit_env is not None:
+            self.revisit_env.close()
+            self.revisit_env = None

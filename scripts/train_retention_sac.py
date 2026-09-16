@@ -387,6 +387,7 @@ def main():
             vem_capacity=args.vem_capacity,
             retention_interval_steps=args.retention_freq,
             learning_starts=LEARNING_STARTS,
+            revisit_rollouts=5,
             verbose=1,
         )
     )
